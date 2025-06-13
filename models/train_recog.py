@@ -1,141 +1,113 @@
 import os
+import cv2
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from torch.nn import CTCLoss
-from torchvision import transforms
+import torchvision.transforms as transforms
 from PIL import Image
 import pandas as pd
 
-# ====== CONFIG ======
-CSV_PATH = r"F:\License-Plate-Detection-and-Recognition\DATA SCIENTIST_ASSIGNMENT\Licplatesrecognition_train.csv"  # your CSV: img_id,text
-IMG_DIR = r"F:\License-Plate-Detection-and-Recognition\DATA SCIENTIST_ASSIGNMENT\license_plates_recognition_train"  # your images folder
-EPOCHS = 20
-BATCH_SIZE = 8
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---- CONFIG ----
+IMG_DIR = 'plates/'
+CSV_PATH = 'plate_labels.csv'
+CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+MAX_LABEL_LEN = 10
+IMG_WIDTH, IMG_HEIGHT = 200, 50
+BATCH_SIZE = 16
+EPOCHS = 30
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# ====== CHAR MAPS ======
-CHARS = "0123456789T"  # Add Arabic or other chars if needed
-CHAR2IDX = {ch: i+1 for i, ch in enumerate(CHARS)}  # +1 because 0 is blank
-CHAR2IDX['<blank>'] = 0
-IDX2CHAR = {i: ch for ch, i in CHAR2IDX.items()}
+# ---- CHAR TO INDEX MAP ----
+char_to_idx = {char: idx + 1 for idx, char in enumerate(CHARS)}
+idx_to_char = {idx + 1: char for idx, char in enumerate(CHARS)}
+char_to_idx['blank'] = 0
+idx_to_char[0] = ''
 
-# ====== DATASET ======
-class LicensePlateDataset(Dataset):
+# ---- Dataset ----
+class PlateDataset(Dataset):
     def __init__(self, csv_path, img_dir):
-        self.df = pd.read_csv(csv_path)
+        self.data = pd.read_csv(csv_path)
         self.img_dir = img_dir
         self.transform = transforms.Compose([
-            transforms.Grayscale(),
-            transforms.Resize((32, 128)),  # H x W
+            transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
             transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
         ])
 
     def __len__(self):
-        return len(self.df)
+        return len(self.data)
+
+    def encode_label(self, label):
+        return [char_to_idx[c] for c in label]
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img_path = os.path.join(self.img_dir, row["img_id"])
-        image = Image.open(img_path).convert("RGB")
+        row = self.data.iloc[idx]
+        img_path = os.path.join(self.img_dir, row['img_id'])
+        image = Image.open(img_path).convert('L')
         image = self.transform(image)
-        label = [CHAR2IDX[c] for c in str(row["text"]) if c in CHAR2IDX]
-        return image, torch.tensor(label, dtype=torch.long)
+        label = self.encode_label(row['text'])
+        return image, torch.tensor(label), len(label)
 
-# ====== COLLATE FUNCTION ======
-def collate_fn(batch):
-    images, labels = zip(*batch)
-    labels = list(labels)
-    return torch.stack(images), labels
-
-# ====== MODEL ======
+# ---- Model (CRNN) ----
 class CRNN(nn.Module):
-    def __init__(self, num_classes=len(CHAR2IDX)):
+    def __init__(self, num_classes):
         super(CRNN, self).__init__()
         self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, 3, 1, 1), nn.ReLU(),
-            nn.MaxPool2d((2, 2)),
-            nn.Conv2d(64, 128, 3, 1, 1), nn.ReLU(),
-            nn.MaxPool2d((2, 2)),
-            nn.Conv2d(128, 256, 3, 1, 1), nn.ReLU(),
+            nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2,2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2,2),
         )
-        self.rnn = nn.LSTM(256 * 8, 256, num_layers=2, bidirectional=True)
+        self.rnn = nn.LSTM(128 * (IMG_HEIGHT//4), 256, bidirectional=True, num_layers=2, batch_first=True)
         self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        x = self.cnn(x)                    # (B, C, H, W)
-        x = x.permute(3, 0, 2, 1)          # (W, B, H, C)
-        T, B, H, C = x.size()
-        x = x.reshape(T, B, H * C)         # (W, B, H*C)
-        x, _ = self.rnn(x)                 # (W, B, 512)
-        x = self.fc(x)                     # (W, B, num_classes)
+        x = self.cnn(x)
+        b, c, h, w = x.size()
+        x = x.permute(0, 3, 1, 2)  # (B, W, C, H)
+        x = x.view(b, w, -1)       # (B, W, C*H)
+        x, _ = self.rnn(x)
+        x = self.fc(x)
         return x
 
-# ====== DECODE FUNCTION ======
-def decode(output):
-    output = output.argmax(2).detach().cpu().numpy()
-    results = []
-    for seq in output.transpose(1, 0):
-        prev = -1
-        decoded = []
-        for ch in seq:
-            if ch != prev and ch != 0:
-                decoded.append(IDX2CHAR[ch])
-            prev = ch
-        results.append(''.join(decoded))
-    return results
+# ---- Collate Fn for CTC ----
+def collate_fn(batch):
+    images, labels, label_lens = zip(*batch)
+    images = torch.stack(images)
+    labels_concat = torch.cat(labels)
+    label_lens = torch.tensor(label_lens)
+    return images, labels_concat, label_lens
 
-# ====== TRAIN FUNCTION ======
+# ---- Training ----
 def train():
-    dataset = LicensePlateDataset(CSV_PATH, IMG_DIR)
+    dataset = PlateDataset(CSV_PATH, IMG_DIR)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
-    model = CRNN().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = CTCLoss(blank=0)
+    model = CRNN(num_classes=len(char_to_idx)).to(DEVICE)
+    criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
-        for imgs, labels in loader:
-            imgs = imgs.to(DEVICE)
-            targets = torch.cat(labels).to(DEVICE)
-            input_lengths = torch.full(size=(imgs.size(0),), fill_value=imgs.shape[-1] // 4, dtype=torch.long)
-            target_lengths = torch.tensor([len(l) for l in labels], dtype=torch.long).to(DEVICE)
+        for images, labels, label_lens in loader:
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
 
-            output = model(imgs)  # (W, B, C)
-            loss = criterion(output.log_softmax(2), targets, input_lengths, target_lengths)
+            logits = model(images)  # (B, W, C)
+            log_probs = nn.functional.log_softmax(logits, dim=2)
+
+            input_len = torch.full(size=(log_probs.size(0),), fill_value=log_probs.size(1), dtype=torch.long).to(DEVICE)
+            loss = criterion(log_probs.permute(1, 0, 2), labels, input_len, label_lens)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
+
         print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {total_loss:.4f}")
 
-    torch.save(model.state_dict(), "crnn_license_plate.pth")
-    return model
+    torch.save(model.state_dict(), 'crnn_plate.pth')
+    print("✅ Model saved as crnn_plate.pth")
 
-# ====== INFERENCE EXAMPLE ======
-def test_single(model, image_path):
-    model.eval()
-    transform = transforms.Compose([
-        transforms.Grayscale(),
-        transforms.Resize((32, 128)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-    img = Image.open(image_path).convert("RGB")
-    img = transform(img).unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        output = model(img)  # (T, B, C)
-    result = decode(output)
-    print("Predicted:", result[0])
-
-# ====== RUN EVERYTHING ======
-if __name__ == "__main__":
-    model = train()
-    # test_single(model, "license_plate_images/103.jpg")  # Uncomment to test
+# ---- Run ----
+if __name__ == '__main__':
+    train()
